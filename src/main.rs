@@ -1,9 +1,10 @@
 mod clipboard_content;
+mod native_clipboard;
 mod network;
 
 use arboard::Clipboard;
 use clap::Parser;
-use clipboard_content::ClipboardContent;
+use clipboard_content::{ClipboardContent, FileEntry};
 use clipboard_master::{CallbackResult, ClipboardHandler, Master};
 use env_logger::Env;
 use log::{debug, error, info, warn};
@@ -20,6 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 struct DeduplicationState {
     last_text: Option<String>,
     last_image_hash: Option<u64>,
+    last_files_hash: Option<u64>,
 }
 
 impl DeduplicationState {
@@ -27,6 +29,7 @@ impl DeduplicationState {
         Self {
             last_text: None,
             last_image_hash: None,
+            last_files_hash: None,
         }
     }
 }
@@ -81,7 +84,78 @@ fn hash_bytes(data: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// 计算文件路径列表的哈希（用于去重）
+fn hash_file_paths(paths: &[PathBuf]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for p in paths {
+        p.to_string_lossy().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 fn get_clipboard_content(sender: mpsc::Sender<ClipboardContent>, dedup: SharedDedup) {
+    // 优先尝试原生文件列表读取（CF_HDROP / text/uri-list）
+    if let Some(file_paths) = native_clipboard::get_clipboard_file_list() {
+        let h = hash_file_paths(&file_paths);
+        let mut guard = match dedup.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                error!("Failed to lock dedup state: {}", e);
+                return;
+            }
+        };
+        if guard.last_files_hash == Some(h) {
+            debug!("Files unchanged (dedup hit), skipping");
+            return;
+        }
+        guard.last_files_hash = Some(h);
+        guard.last_text = None;
+        guard.last_image_hash = None;
+        drop(guard);
+
+        // 读取所有文件内容
+        let mut entries = Vec::new();
+        for path in &file_paths {
+            if !path.is_file() {
+                warn!("跳过非文件路径: {:?}", path);
+                continue;
+            }
+            let file_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            match std::fs::read(path) {
+                Ok(file_bytes) => {
+                    info!("读取文件: {} ({} bytes)", file_name, file_bytes.len());
+                    entries.push(FileEntry {
+                        name: file_name,
+                        bytes: file_bytes,
+                    });
+                }
+                Err(e) => {
+                    warn!("读取文件失败 {:?}: {}", path, e);
+                }
+            }
+        }
+
+        if !entries.is_empty() {
+            let content = if entries.len() == 1 {
+                let entry = entries.remove(0);
+                ClipboardContent::File {
+                    name: entry.name,
+                    bytes: entry.bytes,
+                }
+            } else {
+                ClipboardContent::Files(entries)
+            };
+            info!("发送文件剪贴板内容: {}", content.description());
+            if let Err(e) = sender.try_send(content) {
+                error!("Failed to send clipboard files: {}", e);
+            }
+        }
+        return;
+    }
+
     let mut ctx = match Clipboard::new() {
         Ok(context) => context,
         Err(err) => {
@@ -107,6 +181,7 @@ fn get_clipboard_content(sender: mpsc::Sender<ClipboardContent>, dedup: SharedDe
             }
             guard.last_image_hash = Some(h);
             guard.last_text = None;
+            guard.last_files_hash = None;
             drop(guard);
 
             let content = ClipboardContent::Image {
@@ -141,44 +216,8 @@ fn get_clipboard_content(sender: mpsc::Sender<ClipboardContent>, dedup: SharedDe
             }
             guard.last_text = Some(contents.clone());
             guard.last_image_hash = None;
+            guard.last_files_hash = None;
             drop(guard);
-
-            // 检查文本是否是文件路径列表（支持文件复制同步）
-            let lines: Vec<&str> = contents.lines().collect();
-            if !lines.is_empty()
-                && lines.iter().all(|l| {
-                    let trimmed = l.trim();
-                    if trimmed.is_empty() {
-                        return false;
-                    }
-                    let p = PathBuf::from(trimmed);
-                    p.is_absolute() && p.exists() && p.is_file()
-                })
-            {
-                for line in &lines {
-                    let path = PathBuf::from(line.trim());
-                    let file_name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "unknown".to_string());
-                    match std::fs::read(&path) {
-                        Ok(file_bytes) => {
-                            let content = ClipboardContent::File {
-                                name: file_name.clone(),
-                                bytes: file_bytes,
-                            };
-                            info!("Sending file: {} ({} bytes)", file_name, content.description());
-                            if let Err(e) = sender.try_send(content) {
-                                error!("Failed to send file {}: {}", file_name, e);
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Failed to read file {}: {}", line.trim(), e);
-                        }
-                    }
-                }
-                return;
-            }
 
             let content = ClipboardContent::Text(contents);
             if let Err(e) = sender.try_send(content) {
@@ -204,6 +243,7 @@ fn set_clipboard_content(content: &ClipboardContent, dedup: &SharedDedup) {
             if let Ok(mut guard) = dedup.lock() {
                 guard.last_text = Some(text.clone());
                 guard.last_image_hash = None;
+                guard.last_files_hash = None;
             }
             if let Err(e) = ctx.set_text(text) {
                 error!("Error setting clipboard text: {}", e);
@@ -214,6 +254,7 @@ fn set_clipboard_content(content: &ClipboardContent, dedup: &SharedDedup) {
             if let Ok(mut guard) = dedup.lock() {
                 guard.last_image_hash = Some(h);
                 guard.last_text = None;
+                guard.last_files_hash = None;
             }
             let img = arboard::ImageData {
                 width: *width,
@@ -225,29 +266,40 @@ fn set_clipboard_content(content: &ClipboardContent, dedup: &SharedDedup) {
             }
         }
         ClipboardContent::File { name, bytes } => {
-            let dest_dir = get_file_receive_dir();
-            if let Err(e) = std::fs::create_dir_all(&dest_dir) {
-                error!("Failed to create receive dir {:?}: {}", dest_dir, e);
-                return;
+            save_received_file(name, bytes, &mut ctx, dedup);
+        }
+        ClipboardContent::Files(files) => {
+            for entry in files {
+                save_received_file(&entry.name, &entry.bytes, &mut ctx, dedup);
             }
-            let dest_path = dest_dir.join(name);
-            match std::fs::write(&dest_path, bytes) {
-                Ok(_) => {
-                    info!("File received and saved to: {:?}", dest_path);
-                    let path_str = dest_path.to_string_lossy().to_string();
-                    // 更新 dedup 状态防止回环
-                    if let Ok(mut guard) = dedup.lock() {
-                        guard.last_text = Some(path_str.clone());
-                        guard.last_image_hash = None;
-                    }
-                    if let Err(e) = ctx.set_text(&path_str) {
-                        error!("Error setting file path to clipboard: {}", e);
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to write file {:?}: {}", dest_path, e);
-                }
+        }
+    }
+}
+
+/// 保存接收到的文件到本地，并将路径写入剪贴板
+fn save_received_file(name: &str, bytes: &[u8], ctx: &mut Clipboard, dedup: &SharedDedup) {
+    let dest_dir = get_file_receive_dir();
+    if let Err(e) = std::fs::create_dir_all(&dest_dir) {
+        error!("Failed to create receive dir {:?}: {}", dest_dir, e);
+        return;
+    }
+    let dest_path = dest_dir.join(name);
+    match std::fs::write(&dest_path, bytes) {
+        Ok(_) => {
+            info!("File received and saved to: {:?}", dest_path);
+            let path_str = dest_path.to_string_lossy().to_string();
+            // 更新 dedup 状态防止回环
+            if let Ok(mut guard) = dedup.lock() {
+                guard.last_text = Some(path_str.clone());
+                guard.last_image_hash = None;
+                guard.last_files_hash = None;
             }
+            if let Err(e) = ctx.set_text(&path_str) {
+                error!("Error setting file path to clipboard: {}", e);
+            }
+        }
+        Err(e) => {
+            error!("Failed to write file {:?}: {}", dest_path, e);
         }
     }
 }

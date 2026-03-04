@@ -1,4 +1,6 @@
-use crate::clipboard_content::ClipboardContent;
+use crate::clipboard_content::{
+    split_to_network_messages, sha256_hex, ClipboardContent, NetworkMessage,
+};
 use ed25519_dalek::{pkcs8::DecodePrivateKey, SigningKey};
 use futures::prelude::*;
 use hex_literal::hex;
@@ -23,13 +25,24 @@ use std::hash::{Hash, Hasher};
 use std::{
     error::Error,
     net::{Ipv4Addr, SocketAddrV4},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{mpsc, oneshot};
 
-/// 256KB 文本经 zstd 压缩后的最大传输大小，设置为 2MB 以支持图片和文件
+/// gossipsub 单条消息最大传输大小（2MB，压缩后）
 const MAX_TRANSMIT_SIZE: usize = 2 * 1024 * 1024;
+/// 分片传输的超时时间（秒）
+const CHUNK_TRANSFER_TIMEOUT_SECS: u64 = 120;
+
+/// 正在进行的分片接收状态
+struct ChunkReceiveState {
+    total_chunks: u32,
+    data_hash: String,
+    total_size: u64,
+    received: HashMap<u32, Vec<u8>>,
+    started_at: Instant,
+}
 
 #[derive(NetworkBehaviour)]
 struct P2pClipboardBehaviour {
@@ -54,8 +67,6 @@ struct ConnectionRetryTask {
 #[derive(Default, Clone)]
 struct CompressionTransform;
 
-// Not used directly, we will derive new keys using machine ID from this key.
-// We have to do this to have a stable Peer ID when no key is specified by the user.
 const ID_SEED: [u8; 118] = hex!("2d2d2d2d2d424547494e2050524956415445204b45592d2d2d2d2d0a4d43344341514177425159444b3256774243494549444c3968565958485271304f48386f774a72363169416a45385a52614263363254373761723564397339670a2d2d2d2d2d454e442050524956415445204b45592d2d2d2d2d");
 
 impl gossipsub::DataTransform for CompressionTransform {
@@ -139,14 +150,9 @@ pub async fn start_network(
     };
     let peer_id = PeerId::from(id_keys.public());
     info!("Local peer id: {}", peer_id.to_base58());
-
-    // Create a Gossipsub topic
     let gossipsub_topic = IdentTopic::new("p2p_clipboard");
-
-    // get optional boot address and peerId
     let (boot_addr, boot_peer_id) = match connect_arg {
         Some(arg) => {
-            // Clap should already guarantee length == 2, just for sanity
             if arg.len() == 2 {
                 let peer_id = arg[1].clone().parse::<PeerId>();
                 let addr_input = arg[0].clone();
@@ -168,8 +174,6 @@ pub async fn start_network(
         }
         None => (None, None),
     };
-
-    // Create a Swarm to manage peers and events.
     let mut swarm: Swarm<P2pClipboardBehaviour> = {
         let mut chat_behaviour = P2pClipboardBehaviour {
             gossipsub: create_gossipsub_behavior(id_keys.clone()),
@@ -177,13 +181,10 @@ pub async fn start_network(
             identify: create_identify_behavior(id_keys.public()),
             mdns: create_mdns_behavior(peer_id, psk.clone(), disable_mdns),
         };
-
-        // subscribes to our topic
         chat_behaviour
             .gossipsub
             .subscribe(&gossipsub_topic)
             .unwrap();
-
         libp2p::SwarmBuilder::with_existing_identity(id_keys)
             .with_tokio()
             .with_tcp(
@@ -195,12 +196,10 @@ pub async fn start_network(
             .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
             .build()
     };
-
     swarm
         .behaviour_mut()
         .kademlia
         .set_mode(Some(kad::Mode::Server));
-
     let multiaddr = match listen_arg {
         Some(socket_addr_string) => {
             if let Ok((ip, port)) = parse_ipv4_with_port(Some(socket_addr_string)) {
@@ -209,22 +208,17 @@ pub async fn start_network(
                 Err(())
             }
         }
-        // Listen on all interfaces and whatever port the OS assigns
         None => Ok("/ip4/0.0.0.0/tcp/0".to_string()),
     }
     .unwrap_or_else(|_| {
         error!("Listen address is not a valid socket address");
         std::process::exit(1);
     });
-
     let _ = swarm.listen_on(multiaddr.parse()?).unwrap_or_else(|_| {
         error!("Cannot listen on specified address");
         std::process::exit(1);
     });
-
-    // FIXME: Can we swap the boot_node to some fallback node if it is temporarily unavailable?
     let boot_node = {
-        // Reach out to another node if specified
         if let Some(boot_addr) = boot_addr {
             debug!("Will dial {}", &boot_addr);
             swarm
@@ -264,6 +258,100 @@ pub async fn start_network(
     Ok(())
 }
 
+fn handle_incoming_message(
+    data: &[u8],
+    peer_id: &PeerId,
+    id: &MessageId,
+    chunk_states: &mut HashMap<String, ChunkReceiveState>,
+) -> Option<ClipboardContent> {
+    match NetworkMessage::from_bytes(data) {
+        Ok(net_msg) => match net_msg {
+            NetworkMessage::Direct(content) => {
+                debug!("Got direct message: {} with id: {} from peer: {:?}", content.description(), id, peer_id);
+                return Some(content);
+            }
+            NetworkMessage::ChunkStart { transfer_id, total_chunks, data_hash, total_size } => {
+                info!("分片传输开始: id={}, chunks={}, size={} bytes, from {:?}", transfer_id, total_chunks, total_size, peer_id);
+                chunk_states.insert(transfer_id, ChunkReceiveState {
+                    total_chunks, data_hash, total_size,
+                    received: HashMap::new(),
+                    started_at: Instant::now(),
+                });
+                None
+            }
+            NetworkMessage::Chunk { transfer_id, index, data } => {
+                if let Some(state) = chunk_states.get_mut(&transfer_id) {
+                    debug!("收到分片 {}/{} for transfer {}", index + 1, state.total_chunks, transfer_id);
+                    state.received.insert(index, data);
+                } else {
+                    warn!("收到未知 transfer_id 的分片: {}", transfer_id);
+                }
+                None
+            }
+            NetworkMessage::ChunkEnd { transfer_id } => {
+                if let Some(state) = chunk_states.remove(&transfer_id) {
+                    if state.received.len() as u32 == state.total_chunks {
+                        let mut full_data = Vec::with_capacity(state.total_size as usize);
+                        for i in 0..state.total_chunks {
+                            if let Some(chunk) = state.received.get(&i) {
+                                full_data.extend_from_slice(chunk);
+                            } else {
+                                error!("分片 {} 缺失，传输 {} 失败", i, transfer_id);
+                                return None;
+                            }
+                        }
+                        let actual_hash = sha256_hex(&full_data);
+                        if actual_hash != state.data_hash {
+                            error!("分片传输 {} 哈希校验失败: expected={}, actual={}", transfer_id, state.data_hash, actual_hash);
+                            return None;
+                        }
+                        match ClipboardContent::from_bytes(&full_data) {
+                            Ok(content) => {
+                                info!("分片传输 {} 完成: {}", transfer_id, content.description());
+                                return Some(content);
+                            }
+                            Err(e) => {
+                                error!("分片传输 {} 反序列化失败: {}", transfer_id, e);
+                            }
+                        }
+                    } else {
+                        error!("分片传输 {} 不完整: received={}, expected={}", transfer_id, state.received.len(), state.total_chunks);
+                    }
+                } else {
+                    warn!("收到未知 transfer_id 的 ChunkEnd: {}", transfer_id);
+                }
+                None
+            }
+        },
+        Err(_) => {
+            match ClipboardContent::from_bytes(data) {
+                Ok(content) => {
+                    debug!("Got legacy ClipboardContent: {} with id: {} from peer: {:?}", content.description(), id, peer_id);
+                    Some(content)
+                }
+                Err(_) => {
+                    let text = String::from_utf8_lossy(data).to_string();
+                    debug!("Got legacy text message with id: {} from peer: {:?}", id, peer_id);
+                    Some(ClipboardContent::Text(text))
+                }
+            }
+        }
+    }
+}
+
+fn cleanup_stale_chunk_states(chunk_states: &mut HashMap<String, ChunkReceiveState>) {
+    let timeout = Duration::from_secs(CHUNK_TRANSFER_TIMEOUT_SECS);
+    let stale_ids: Vec<String> = chunk_states
+        .iter()
+        .filter(|(_, state)| state.started_at.elapsed() > timeout)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in stale_ids {
+        warn!("分片传输 {} 超时，清理状态", id);
+        chunk_states.remove(&id);
+    }
+}
+
 async fn run(
     mut swarm: Swarm<P2pClipboardBehaviour>,
     gossipsub_topic: IdentTopic,
@@ -273,28 +361,54 @@ async fn run(
     retry_queue_tx: UnboundedSender<ConnectionRetryTask>,
     mut retry_callback_queue_rx: UnboundedReceiver<PeerEndpointCache>,
 ) {
-    // We have to cache all endpoints so that we can reconnect to the p2p networks when our IP has changed.
     let mut endpoint_cache: VecDeque<PeerEndpointCache> = VecDeque::new();
     let mut unique_endpoints: HashSet<PeerEndpointCache> = HashSet::new();
     let mut current_listen_addresses: HashSet<Multiaddr> = HashSet::new();
-    // We also need to cache the announced identity for each node, because they will be different from what we actually connects.
     let mut announced_identities: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
     let mut failing_connections: HashMap<PeerEndpointCache, ConnectionRetryTask> = HashMap::new();
-
+    let mut chunk_states: HashMap<String, ChunkReceiveState> = HashMap::new();
+    // 待发送的分片消息队列
+    let mut pending_chunks: VecDeque<Vec<u8>> = VecDeque::new();
     let mut t = SystemTime::now();
     let mut sleep;
     loop {
-        let to_publish = {
+        // 每轮循环清理超时的分片状态
+        cleanup_stale_chunk_states(&mut chunk_states);
+        let to_publish: Option<Vec<u8>> = {
             sleep = Box::pin(tokio::time::sleep(Duration::from_secs(30)).fuse());
+            // 优先发送待发送的分片
+            if let Some(chunk_data) = pending_chunks.pop_front() {
+                Some(chunk_data)
+            } else {
             tokio::select! {
                 Some(message) = rx.recv() => {
                     debug!("Received local clipboard: {}", message.description());
-                    match message.to_bytes() {
-                        Ok(bytes) => Some((gossipsub_topic.clone(), bytes)),
-                        Err(e) => {
-                            error!("Failed to serialize clipboard content: {}", e);
-                            None
+                    match split_to_network_messages(&message) {
+                        Ok(net_msgs) => {
+                            if net_msgs.len() == 1 {
+                                match net_msgs[0].to_bytes() {
+                                    Ok(bytes) => Some(bytes),
+                                    Err(e) => { error!("Failed to serialize: {}", e); None }
+                                }
+                            } else {
+                                info!("大数据分片传输: {} 个消息", net_msgs.len());
+                                let mut first = None;
+                                for msg in net_msgs {
+                                    match msg.to_bytes() {
+                                        Ok(bytes) => {
+                                            if first.is_none() {
+                                                first = Some(bytes);
+                                            } else {
+                                                pending_chunks.push_back(bytes);
+                                            }
+                                        }
+                                        Err(e) => { error!("Failed to serialize chunk: {}", e); }
+                                    }
+                                }
+                                first
+                            }
                         }
+                        Err(e) => { error!("Failed to split message: {}", e); None }
                     }
                 },
                 event = swarm.select_next_some() => match event {
@@ -305,24 +419,9 @@ async fn run(
                             message,
                         } = gossip_event
                         {
-                            match ClipboardContent::from_bytes(&message.data) {
-                                Ok(content) => {
-                                    debug!("Got message: {} with id: {} from peer: {:?}",
-                                        content.description(),
-                                        id,
-                                        peer_id);
-                                    if let Err(e) = tx.send(content).await {
-                                        error!("Panic when sending to channel: {}", e);
-                                    }
-                                }
-                                Err(e) => {
-                                    // 向后兼容：尝试作为纯文本解析（旧版本发送的消息）
-                                    let text = String::from_utf8_lossy(&message.data).to_string();
-                                    debug!("Got legacy text message with id: {} from peer: {:?} (bincode err: {})",
-                                        id, peer_id, e);
-                                    if let Err(e) = tx.send(ClipboardContent::Text(text)).await {
-                                        error!("Panic when sending to channel: {}", e);
-                                    }
+                            if let Some(content) = handle_incoming_message(&message.data, peer_id, id, &mut chunk_states) {
+                                if let Err(e) = tx.send(content).await {
+                                    error!("Panic when sending to channel: {}", e);
                                 }
                             }
                         }
@@ -330,102 +429,66 @@ async fn run(
                     }
                     SwarmEvent::Behaviour(P2pClipboardBehaviourEvent::Identify(ref identify_event)) => {
                         match identify_event {
-                            identify::Event::Received {
-                                connection_id: _,
-                                peer_id,
-                                info:
-                                identify::Info {
-                                    listen_addrs,
-                                    ..
-                                },
-                            } => {
-                                // We will receive identify info for 3 reasons:
-                                // 1. A new peer want to give us its info for negotiation
-                                // 2. An existing peer periodically ping us with these info to show existence
-                                // 3. An existing peer has its network config changed and want to tell us its new address
-                                // FIXME: In some cases the peers could behind some kind of NAT so they can have their addresses changed without announcing the change.
-                                let old_addrs = announced_identities.insert(
-                                    *peer_id,
-                                    listen_addrs.clone()
-                                );
+                            identify::Event::Received { connection_id: _, peer_id, info: identify::Info { listen_addrs, .. } } => {
+                                let old_addrs = announced_identities.insert(*peer_id, listen_addrs.clone());
                                 if let Some(old_vec) = old_addrs {
                                     let new: HashSet<Multiaddr> = listen_addrs.iter().cloned().collect();
                                     let old: HashSet<Multiaddr> = old_vec.iter().cloned().collect();
-                                    // Announced in old but not in new announcement, remove it from routing table
-                                    let changes = old.difference(&new);
-                                    for addr in changes {
+                                    for addr in old.difference(&new) {
                                         debug!("Removing expired addr {addr} trough identify");
-                                        swarm.behaviour_mut().kademlia.remove_address(&peer_id, addr);
+                                        swarm.behaviour_mut().kademlia.remove_address(peer_id, addr);
                                     }
                                 }
                                 for addr in listen_addrs {
                                     debug!("received addr {addr} trough identify");
                                     if !is_multiaddr_local(addr) {
-                                        swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                                        swarm.behaviour_mut().kademlia.add_address(peer_id, addr.clone());
                                     }
                                 }
                             }
-                            _ => {
-                                debug!("got other identify event");
-                            }
+                            _ => { debug!("got other identify event"); }
                         }
                         None
                     }
                     SwarmEvent::Behaviour(P2pClipboardBehaviourEvent::Kademlia(ref kad_event)) => {
                         match kad_event {
-                            kad::Event::RoutingUpdated {peer, ..} => {
-                                debug!("Routing updated for {:#?}", peer);
-                            },
-                            kad::Event::OutboundQueryProgressed {
-                                result: QueryResult::GetClosestPeers(result),
-                                ..
-                            } => {
-                            match result {
-                                Ok(kad::GetClosestPeersOk { key: _, peers }) => {
-                                    if !peers.is_empty() {
-                                        debug!("Query finished with closest peers: {:#?}", peers);
-                                        for peer in peers {
-                                            debug!("Got peer {:?}", peer);
+                            kad::Event::RoutingUpdated { peer, .. } => { debug!("Routing updated for {:#?}", peer); },
+                            kad::Event::OutboundQueryProgressed { result: QueryResult::GetClosestPeers(result), .. } => {
+                                match result {
+                                    Ok(kad::GetClosestPeersOk { key: _, peers }) => {
+                                        if !peers.is_empty() {
+                                            debug!("Query finished with closest peers: {:#?}", peers);
+                                        } else {
+                                            error!("Query finished with no closest peers.");
                                         }
-                                    } else {
-                                        error!("Query finished with no closest peers.")
                                     }
-                                }
-                                Err(kad::GetClosestPeersError::Timeout { peers, .. }) => {
-                                    if !peers.is_empty() {
-                                        error!("Query timed out with closest peers: {:#?}", peers);
-                                        for peer in peers {
-                                            debug!("Got peer {:?}", peer);
+                                    Err(kad::GetClosestPeersError::Timeout { peers, .. }) => {
+                                        if !peers.is_empty() {
+                                            error!("Query timed out with closest peers: {:#?}", peers);
+                                        } else {
+                                            error!("Query timed out with no closest peers.");
                                         }
-                                    } else {
-                                        error!("Query timed out with no closest peers.");
                                     }
-                                }
-                            };
-                        }
+                                };
+                            }
                             _ => {}
                         }
                         None
                     }
                     SwarmEvent::NewListenAddr { ref address, .. } => {
                         info!("Local node is listening on {address}");
-                        let non_local_addr_count = current_listen_addresses
-                            .iter()
-                            .filter(|&addr| !is_multiaddr_local(addr))
-                            .count();
+                        let non_local_addr_count = current_listen_addresses.iter().filter(|&addr| !is_multiaddr_local(addr)).count();
                         current_listen_addresses.insert(address.clone());
                         let mut peers_to_push: Vec<PeerId> = Vec::new();
                         if let Some(boot_node_clone) = boot_node.as_ref() {
-                            peers_to_push.push(boot_node_clone.peer_id.clone());
+                            peers_to_push.push(boot_node_clone.peer_id);
                         }
-                        swarm.behaviour_mut().identify.push(peers_to_push.clone());
-                        let connected_peers = swarm.connected_peers();
-                        let connected_peers_count = connected_peers.count();
+                        swarm.behaviour_mut().identify.push(peers_to_push);
+                        let connected_peers_count = swarm.connected_peers().count();
                         debug!("Connected to {connected_peers_count} peers");
-                        if let None = boot_node.as_ref() {
+                        if boot_node.is_none() {
                             info!("No boot node specified. Waiting for connection.");
                         } else if connected_peers_count == 0 || non_local_addr_count == 0 {
-                            debug!("No connected peers or recovered from no network, we need to manually re-dial to the boot node");
                             if let Some(real_boot_node) = boot_node.as_ref() {
                                 let _ = swarm.dial(real_boot_node.address.clone());
                             }
@@ -436,25 +499,17 @@ async fn run(
                     SwarmEvent::ExpiredListenAddr { ref address, .. } => {
                         warn!("Local node no longer listening on {address}");
                         current_listen_addresses.remove(address);
-                        let non_local_addr_count = current_listen_addresses
-                            .iter()
-                            .filter(|&addr| !is_multiaddr_local(addr))
-                            .count();
+                        let non_local_addr_count = current_listen_addresses.iter().filter(|&addr| !is_multiaddr_local(addr)).count();
                         let mut peers_to_push: Vec<PeerId> = Vec::new();
                         if let Some(boot_node_clone) = boot_node.as_ref() {
-                            peers_to_push.push(boot_node_clone.peer_id.clone());
+                            peers_to_push.push(boot_node_clone.peer_id);
                         }
-                        swarm.behaviour_mut().identify.push(peers_to_push.clone());
+                        swarm.behaviour_mut().identify.push(peers_to_push);
                         if non_local_addr_count > 0 {
                             if let Some(real_boot_node) = boot_node.as_ref() {
-                                // Because when main address is teared down, the network usually needs some time to recover
-                                // We send it to the retry queue directly
-                                let retry_task = match failing_connections.get(&real_boot_node) {
+                                let retry_task = match failing_connections.get(real_boot_node) {
                                     Some(task) => task.clone(),
-                                    None => ConnectionRetryTask {
-                                        target: real_boot_node.clone(),
-                                        retry_count: 0,
-                                    }
+                                    None => ConnectionRetryTask { target: real_boot_node.clone(), retry_count: 0 }
                                 };
                                 failing_connections.insert(real_boot_node.clone(), retry_task.clone());
                                 let _ = retry_queue_tx.send(retry_task);
@@ -462,20 +517,11 @@ async fn run(
                         }
                         None
                     }
-                    SwarmEvent::ConnectionEstablished {
-                        ref peer_id,
-                        ref endpoint,
-                        ..
-                    } => {
-                        // We only care about IP and protocol port, ignoring the p2p suffix
+                    SwarmEvent::ConnectionEstablished { ref peer_id, ref endpoint, .. } => {
                         let real_address = get_non_p2p_multiaddr(endpoint.get_remote_address().clone());
-                        let cache = PeerEndpointCache {
-                            peer_id: peer_id.clone(),
-                            address: real_address.clone(),
-                        };
+                        let cache = PeerEndpointCache { peer_id: *peer_id, address: real_address.clone() };
                         debug!("Adding endpoint {real_address} to cache");
                         if !unique_endpoints.insert(cache.clone()) {
-                            // The item is already present in the set (duplicate)
                             debug!("endpoint {real_address} already in cache, reordering");
                             endpoint_cache.retain(|existing_item| existing_item != &cache);
                         } else {
@@ -485,145 +531,76 @@ async fn run(
                         endpoint_cache.push_front(cache);
                         None
                     }
-                    SwarmEvent::ConnectionClosed { ref peer_id, ref cause,ref endpoint, ref num_established, .. } => {
+                    SwarmEvent::ConnectionClosed { ref peer_id, ref cause, ref endpoint, ref num_established, .. } => {
                         if *num_established == 0 {
                             warn!("Peer {} has disconnected", peer_id);
-                            // When the last connection has closed, we should drop that peer from our cache.
-                            // Ideally, all entries related with the peer should have already been removed.
-                            // However, some edge cases that does not correctly trigger the event handlers do occur in rare cases.
-                            // Remove these entries explicitly if that happens.
                             unique_endpoints.retain(|x| x.peer_id != *peer_id);
                             endpoint_cache.retain(|x| x.peer_id != *peer_id);
                         }
-                        if let Some(connection_error) = cause.as_ref().clone() {
+                        if let Some(connection_error) = cause.as_ref() {
                             unique_endpoints.retain(|x| x.address != *endpoint.get_remote_address());
                             endpoint_cache.retain(|x| x.address != *endpoint.get_remote_address());
-                            match connection_error {
-                                ConnectionError::IO(_io_error) => {
-                                    // Handle IO error
-                                    // An IO error usually means a network problem occurred on local side, and we will try to re-connect.
-                                    let addr = endpoint.get_remote_address();
-                                    if endpoint.is_dialer() {
-                                        let failed_connection = PeerEndpointCache {
-                                            address: addr.clone(),
-                                            peer_id: peer_id.clone(),
-                                        };
-                                        let retry_task = match failing_connections.get(&failed_connection) {
-                                            Some(task) => task.clone(),
-                                            None => ConnectionRetryTask {
-                                                target: failed_connection.clone(),
-                                                retry_count: 0,
-                                            }
-                                        };
-                                        failing_connections.insert(failed_connection, retry_task.clone());
-                                        let _ = retry_queue_tx.send(retry_task);
-                                    }
+                            if let ConnectionError::IO(_) = connection_error {
+                                let addr = endpoint.get_remote_address();
+                                if endpoint.is_dialer() {
+                                    let failed_connection = PeerEndpointCache { address: addr.clone(), peer_id: *peer_id };
+                                    let retry_task = match failing_connections.get(&failed_connection) {
+                                        Some(task) => task.clone(),
+                                        None => ConnectionRetryTask { target: failed_connection.clone(), retry_count: 0 }
+                                    };
+                                    failing_connections.insert(failed_connection, retry_task.clone());
+                                    let _ = retry_queue_tx.send(retry_task);
                                 }
-                                _ => {}
                             }
                         }
                         None
                     }
-                    SwarmEvent::OutgoingConnectionError {
-                        ref peer_id,
-                        ref error,
-                        connection_id,
-                    } => {
+                    SwarmEvent::OutgoingConnectionError { ref peer_id, ref error, connection_id } => {
                         debug!("OutgoingConnectionError to {peer_id:?} on {connection_id:?} - {error:?}");
-                        // We need to decide if this was a critical error and the peer should be removed from the routing table.
-                        // For a peer that has successfully connected but then disconnected, the SwarmEvent::ConnectionClosed handler handles that.
-                        // If the error goes here, it usually means we cannot connect to that peer with given address in the first place.
                         let should_clean_peer = match error {
                             swarm::DialError::Transport(errors) => {
-                                // Most of the transport error comes from local end and the remote peer should not be removed.
-                                // Even if it is really the remote end, it is hard to tell because if we have multiple
-                                // IP addresses and not all of them is able to connect to the remote endpoint, we may still
-                                // have other IP address that is able to connect to that peer.
-                                // To mitigate that, only remove that specific endpoint instead of everything about that peer.
-                                debug!("Dial errors len : {:?}", errors.len());
                                 let mut non_recoverable = false;
                                 for (addr, err) in errors {
-                                    debug!("OutgoingTransport error : {err:?}");
                                     match err {
                                         libp2p::TransportError::MultiaddrNotSupported(addr) => {
                                             error!("Multiaddr not supported : {addr:?}");
-                                            // If we can't dial a peer on a given address, we should remove it from the routing table
-                                            // Currently we should not have such problem in production as all nodes using selected Multiaddr
-                                            // This could occur during development, added for sanity.
-                                            non_recoverable = true
+                                            non_recoverable = true;
                                         }
                                         libp2p::TransportError::Other(err) => {
                                             let should_hold_and_retry = ["NetworkUnreachable", "Timeout"];
                                             if let Some(inner) = err.get_ref() {
                                                 let error_msg = format!("{inner:?}");
-                                                debug!("Problematic error encountered: {inner:?}");
                                                 if let Some(peer) = peer_id {
-                                                    let failed_connection = PeerEndpointCache {
-                                                        address: addr.clone(),
-                                                        peer_id: peer.clone(),
-                                                    };
-                                                    // This is not the best way to match an Error, but the Error we get here is very complicated, like:
-                                                    // `Other(Custom { kind: Other, error: Timeout })`
-                                                    // `Other(Left(Left(Os { code: 51, kind: NetworkUnreachable, message: "Network is unreachable" })`
-                                                    // `Other(Left(Left(Os { code: 61, kind: ConnectionRefused, message: "Connection refused" })`
-                                                    // Makes appropriate matching very hard if we want to match a specific type of error.
-                                                    if should_hold_and_retry.iter().any(|err| error_msg.contains(err)) {
-                                                        let retry_task = match failing_connections.get(&failed_connection) {
-                                                            Some(task) => task.clone(),
-                                                            None => ConnectionRetryTask {
-                                                                target: failed_connection.clone(),
-                                                                retry_count: 0,
-                                                            }
-                                                        };
-                                                        failing_connections.insert(failed_connection, retry_task.clone());
-                                                        let _ = retry_queue_tx.send(retry_task);
+                                                    let fc = PeerEndpointCache { address: addr.clone(), peer_id: *peer };
+                                                    if should_hold_and_retry.iter().any(|e| error_msg.contains(e)) {
+                                                        let rt = failing_connections.get(&fc).cloned().unwrap_or(ConnectionRetryTask { target: fc.clone(), retry_count: 0 });
+                                                        failing_connections.insert(fc, rt.clone());
+                                                        let _ = retry_queue_tx.send(rt);
                                                     } else {
-                                                        // If we are not retrying, we should do some cleanup at this endpoint.
-                                                        unique_endpoints.retain(|endpoint| endpoint.address != *addr);
-                                                        endpoint_cache.retain(|endpoint| endpoint.address != *addr);
-                                                        failing_connections.remove(&failed_connection);
+                                                        unique_endpoints.retain(|ep| ep.address != *addr);
+                                                        endpoint_cache.retain(|ep| ep.address != *addr);
+                                                        failing_connections.remove(&fc);
                                                         swarm.behaviour_mut().kademlia.remove_address(peer, addr);
                                                     }
                                                 }
-                                            };
+                                            }
                                         }
                                     }
                                 }
                                 non_recoverable
                             }
-                            swarm::DialError::NoAddresses => {
-                                // We cannot dial peers without addresses
-                                error!("OutgoingConnectionError: No address provided");
-                                true
-                            }
-                            swarm::DialError::Aborted => {
-                                error!("OutgoingConnectionError: Aborted");
-                                false
-                            }
-                            swarm::DialError::DialPeerConditionFalse(_) => {
-                                error!("OutgoingConnectionError: DialPeerConditionFalse");
-                                false
-                            }
-                            swarm::DialError::LocalPeerId { .. } => {
-                                error!("OutgoingConnectionError: LocalPeerId: We are dialing ourselves");
-                                true
-                            }
-                            swarm::DialError::WrongPeerId { obtained, address } => {
-                                error!("OutgoingConnectionError: WrongPeerId: obtained: {obtained:?}, address: {address:?}");
-                                true
-                            }
-                            swarm::DialError::Denied { cause } => {
-                                error!("OutgoingConnectionError: Denied: {cause:?}");
-                                true
-                            }
+                            swarm::DialError::NoAddresses => { error!("No address provided"); true }
+                            swarm::DialError::Aborted => { error!("Aborted"); false }
+                            swarm::DialError::DialPeerConditionFalse(_) => { false }
+                            swarm::DialError::LocalPeerId { .. } => { error!("Dialing ourselves"); true }
+                            swarm::DialError::WrongPeerId { obtained, address } => { error!("WrongPeerId: {obtained:?} {address:?}"); true }
+                            swarm::DialError::Denied { cause } => { error!("Denied: {cause:?}"); true }
                         };
-
                         if should_clean_peer {
-                            if let Some(dead_peer) = peer_id
-                            {
+                            if let Some(dead_peer) = peer_id {
                                 warn!("Cleaning out dead peer {dead_peer:?}");
-                                unique_endpoints.retain(|endpoint| endpoint.peer_id != *dead_peer);
-                                endpoint_cache.retain(|endpoint| endpoint.peer_id != *dead_peer);
+                                unique_endpoints.retain(|ep| ep.peer_id != *dead_peer);
+                                endpoint_cache.retain(|ep| ep.peer_id != *dead_peer);
                                 swarm.behaviour_mut().kademlia.remove_peer(dead_peer);
                             }
                         }
@@ -635,63 +612,38 @@ async fn run(
                             let _ = swarm.dial(addr.clone());
                         }
                         None
-                    },
+                    }
                     SwarmEvent::Behaviour(P2pClipboardBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
                         for (peer_id, addr) in list {
                             debug!("mDNS expired a peer: {peer_id}");
-                            // For most time this address should already be removed.
                             swarm.behaviour_mut().kademlia.remove_address(&peer_id, &addr);
                         }
                         None
-                    },
-                    _ => {None}
+                    }
+                    _ => { None }
                 },
                 Some(failing_connection) = retry_callback_queue_rx.recv() => {
                     if let Some(retry_task) = failing_connections.get_mut(&failing_connection) {
-                        // Perform some check to ensure doing a connection retry is reasonable
                         let is_network_ok = {
-                            let non_local_listener_count = current_listen_addresses
-                                .iter()
-                                .filter(|&addr| !is_multiaddr_local(addr))
-                                .count();
+                            let non_local_listener_count = current_listen_addresses.iter().filter(|&addr| !is_multiaddr_local(addr)).count();
                             if swarm.connected_peers().count() > 0 {
-                                // If we already have other peers connected, we have at least one working network interface
                                 true
                             } else if non_local_listener_count > 0 {
-                                // If we have a non-local listening address, let's hope that address will work.
-                                let link_local_listener_count = current_listen_addresses
-                                .iter()
-                                .filter(|&addr| is_multiaddr_link_local(addr))
-                                .count();
-                                // Special cases for link-local addresses.
-                                // Some OS services will use tun interfaces with link-local addresses which may confuses us.
-                                // Users could also have interfaces not configured.
+                                let link_local_count = current_listen_addresses.iter().filter(|&addr| is_multiaddr_link_local(addr)).count();
                                 if is_multiaddr_link_local(&retry_task.target.address) {
-                                    if link_local_listener_count == 0 {
-                                        debug!("Connecting to link-local address {}, but we don't have any link-local addresses.", retry_task.target.address);
-                                        false
-                                    } else {
-                                        true
-                                    }
+                                    link_local_count > 0
                                 } else {
-                                    if link_local_listener_count < non_local_listener_count {
-                                        true
-                                    } else {
-                                        debug!("Connecting to address {}, but all we have are link-local addresses.", retry_task.target.address);
-                                        false
-                                    }
+                                    link_local_count < non_local_listener_count
                                 }
-                            } else {
-                                false
-                            }
+                            } else { false }
                         };
                         let is_task_ok = retry_task.retry_count <= 3;
                         let already_connected = swarm.is_connected(&retry_task.target.peer_id);
                         if !is_network_ok {
-                            debug!("We don't have working network connections yet, waiting.");
+                            debug!("No working network yet, waiting.");
                             let _ = retry_queue_tx.send(retry_task.clone());
                         } else if !is_task_ok {
-                            error!("Connect to {} with {} failed too many times, give up.", retry_task.target.peer_id, retry_task.target.address);
+                            error!("Connect to {} failed too many times, give up.", retry_task.target.peer_id);
                             failing_connections.remove(&failing_connection);
                         } else if already_connected {
                             debug!("Already connected to {}, stop retrying.", retry_task.target.peer_id);
@@ -710,24 +662,18 @@ async fn run(
                         .map(|(peer, _)| peer.clone())
                         .collect();
                     for peer in stale_peers {
-                        // This is a strange upstream bug. Sometimes a peer may appear connected but without any topic subscriptions.
-                        // If this happens we want to drop the connection and wait for the remote peer to reconnect later.
-                        let _ = &swarm.disconnect_peer_id(peer);
+                        let _ = swarm.disconnect_peer_id(peer);
                     }
                     if let Some(boot) = boot_node.as_ref() {
-                        // We started with a boot node, so we want to make sure that we do have at least one peer.
-                        // Although the boot node may be offline, we want to connect to it if we don't have any other peers, in case it is started later.
-                        let all_peers = swarm.connected_peers();
-                        let should_redial_boot_node = all_peers.count() < 1;
-                        if should_redial_boot_node {
+                        if swarm.connected_peers().count() < 1 {
                             let _ = swarm.dial(boot.address.clone());
                         }
                     }
-                    // Look up ourselves to improve awareness in the network.
                     let self_id = *swarm.local_peer_id();
                     swarm.behaviour_mut().kademlia.get_closest_peers(self_id);
                     None
                 }
+            }
             }
         };
         let d = SystemTime::now()
@@ -735,25 +681,18 @@ async fn run(
             .unwrap_or_else(|_| Duration::from_secs(0));
         t = SystemTime::now();
         if d > Duration::from_secs(60) {
-            // We should already update the timer after each loop completes, and we have a 30-second timeout for periodic tasks.
-            // If the duration of this loop execution is too long (2 * timeout), our execution may be suspended midway.
-            // A common reason for such suspension is the host OS entering a power-saving energy state.
-            // We need to break out of the loop and restart swarm since most of our underlying connections will break.
-            // The easiest way to recover is to restart.
             warn!("Handler completed longer than expected, restarting swarm");
             return;
         }
-        if let Some((topic, data)) = to_publish {
+        if let Some(data) = to_publish {
             if let Err(err) = swarm
                 .behaviour_mut()
                 .gossipsub
-                .publish(topic.clone(), data)
+                .publish(gossipsub_topic.clone(), data)
             {
                 match err {
                     PublishError::Duplicate => {}
-                    _ => {
-                        error!("Error publishing message: {}", err);
-                    }
+                    _ => { error!("Error publishing message: {}", err); }
                 }
             }
         }
@@ -761,14 +700,11 @@ async fn run(
 }
 
 fn create_gossipsub_behavior(id_keys: Keypair) -> Behaviour<CompressionTransform> {
-    // Hash the message and use it as ID
-    // Duplicated message will be ignored and not sent because they will have same hash
     let message_id_fn = |message: &gossipsub::Message| {
         let mut s = DefaultHasher::new();
         message.data.hash(&mut s);
         MessageId::from(s.finish().to_string())
     };
-
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_secs(10))
         .validation_mode(ValidationMode::Strict)
@@ -828,7 +764,6 @@ fn create_mdns_behavior(
 fn parse_ipv4_with_port(input: Option<String>) -> Result<(Ipv4Addr, u16), &'static str> {
     if let Some(input_str) = input {
         let parts: Vec<&str> = input_str.split(':').collect();
-
         if parts.len() == 2 {
             let socket_address: Result<SocketAddrV4, _> = input_str.parse();
             match socket_address {
@@ -853,14 +788,14 @@ fn get_non_p2p_multiaddr(mut origin_addr: Multiaddr) -> Multiaddr {
     while origin_addr.iter().count() > 2 {
         let _ = origin_addr.pop();
     }
-    return origin_addr;
+    origin_addr
 }
 
 fn is_multiaddr_link_local(addr: &Multiaddr) -> bool {
     if let Protocol::Ip4(ip) = addr.iter().collect::<Vec<_>>()[0] {
         return ip.is_link_local();
     }
-    return false;
+    false
 }
 
 fn is_multiaddr_local(addr: &Multiaddr) -> bool {
