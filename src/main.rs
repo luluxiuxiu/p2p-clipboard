@@ -8,11 +8,13 @@ use clap::Parser;
 use clipboard_content::{ClipboardContent, FileEntry};
 use clipboard_master::{CallbackResult, ClipboardHandler, Master};
 use fern::Dispatch;
+use image::ImageFormat;
 use log::{debug, error, info, warn, LevelFilter};
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io;
+use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
@@ -185,14 +187,20 @@ fn get_clipboard_content(sender: mpsc::Sender<ClipboardContent>, dedup: SharedDe
             guard.last_files_hash = None;
             drop(guard);
 
-            let content = ClipboardContent::Image {
-                width: img_data.width,
-                height: img_data.height,
-                bytes: img_data.bytes.into_owned(),
-            };
-            debug!("Clipboard image: {}", content.description());
-            if let Err(e) = sender.try_send(content) {
-                error!("Failed to send clipboard image: {}", e);
+            // 将 RGBA 像素编码为 PNG 格式传输（跨平台统一、体积更小）
+            match encode_rgba_to_png(&img_data.bytes, img_data.width as u32, img_data.height as u32) {
+                Ok(png_bytes) => {
+                    info!("图片编码为 PNG: {}x{}, RGBA {} bytes -> PNG {} bytes",
+                        img_data.width, img_data.height, img_data.bytes.len(), png_bytes.len());
+                    let content = ClipboardContent::Image { png_bytes };
+                    debug!("Clipboard image: {}", content.description());
+                    if let Err(e) = sender.try_send(content) {
+                        error!("Failed to send clipboard image: {}", e);
+                    }
+                }
+                Err(e) => {
+                    error!("图片编码为 PNG 失败: {}", e);
+                }
             }
             return;
         }
@@ -250,59 +258,133 @@ fn set_clipboard_content(content: &ClipboardContent, dedup: &SharedDedup) {
                 error!("Error setting clipboard text: {}", e);
             }
         }
-        ClipboardContent::Image { width, height, bytes } => {
-            let h = hash_bytes(bytes);
+        ClipboardContent::Image { png_bytes } => {
+            let h = hash_bytes(png_bytes);
             if let Ok(mut guard) = dedup.lock() {
                 guard.last_image_hash = Some(h);
                 guard.last_text = None;
                 guard.last_files_hash = None;
             }
-            let img = arboard::ImageData {
-                width: *width,
-                height: *height,
-                bytes: Cow::Borrowed(bytes.as_slice()),
-            };
-            if let Err(e) = ctx.set_image(img) {
-                error!("Error setting clipboard image: {}", e);
+            // 将 PNG 解码为 RGBA 像素，再写入剪贴板
+            match decode_png_to_rgba(png_bytes) {
+                Ok((width, height, rgba_bytes)) => {
+                    let img = arboard::ImageData {
+                        width,
+                        height,
+                        bytes: Cow::Owned(rgba_bytes),
+                    };
+                    if let Err(e) = ctx.set_image(img) {
+                        error!("Error setting clipboard image: {}", e);
+                    } else {
+                        info!("已将 PNG 图片写入剪贴板: {}x{}", width, height);
+                    }
+                }
+                Err(e) => {
+                    error!("PNG 解码失败: {}", e);
+                }
             }
         }
         ClipboardContent::File { name, bytes } => {
-            save_received_file(name, bytes, &mut ctx, dedup);
+            let saved_paths = save_received_files(&[(name.as_str(), bytes.as_slice())]);
+            set_file_clipboard(&saved_paths, dedup);
         }
         ClipboardContent::Files(files) => {
-            for entry in files {
-                save_received_file(&entry.name, &entry.bytes, &mut ctx, dedup);
-            }
+            let file_refs: Vec<(&str, &[u8])> = files
+                .iter()
+                .map(|f| (f.name.as_str(), f.bytes.as_slice()))
+                .collect();
+            let saved_paths = save_received_files(&file_refs);
+            set_file_clipboard(&saved_paths, dedup);
         }
     }
 }
 
-/// 保存接收到的文件到本地，并将路径写入剪贴板
-fn save_received_file(name: &str, bytes: &[u8], ctx: &mut Clipboard, dedup: &SharedDedup) {
+/// 批量保存接收到的文件到本地，返回成功保存的路径列表
+fn save_received_files(files: &[(&str, &[u8])]) -> Vec<PathBuf> {
     let dest_dir = get_file_receive_dir();
     if let Err(e) = std::fs::create_dir_all(&dest_dir) {
         error!("Failed to create receive dir {:?}: {}", dest_dir, e);
+        return Vec::new();
+    }
+
+    let mut saved_paths = Vec::new();
+    for (name, bytes) in files {
+        let dest_path = dest_dir.join(name);
+        match std::fs::write(&dest_path, bytes) {
+            Ok(_) => {
+                info!("文件已保存: {:?} ({} bytes)", dest_path, bytes.len());
+                saved_paths.push(dest_path);
+            }
+            Err(e) => {
+                error!("写入文件失败 {:?}: {}", dest_path, e);
+            }
+        }
+    }
+    saved_paths
+}
+
+/// 将已保存的文件路径列表写入剪贴板（使用原生格式）
+/// Windows: CF_HDROP 格式，可在资源管理器中直接粘贴
+/// Linux: text/uri-list + x-special/gnome-copied-files 格式
+fn set_file_clipboard(saved_paths: &[PathBuf], dedup: &SharedDedup) {
+    if saved_paths.is_empty() {
         return;
     }
-    let dest_path = dest_dir.join(name);
-    match std::fs::write(&dest_path, bytes) {
-        Ok(_) => {
-            info!("File received and saved to: {:?}", dest_path);
-            let path_str = dest_path.to_string_lossy().to_string();
-            // 更新 dedup 状态防止回环
-            if let Ok(mut guard) = dedup.lock() {
-                guard.last_text = Some(path_str.clone());
-                guard.last_image_hash = None;
-                guard.last_files_hash = None;
-            }
-            if let Err(e) = ctx.set_text(&path_str) {
-                error!("Error setting file path to clipboard: {}", e);
-            }
-        }
-        Err(e) => {
-            error!("Failed to write file {:?}: {}", dest_path, e);
-        }
+
+    // 更新 dedup 状态防止回环
+    let h = hash_file_paths(saved_paths);
+    if let Ok(mut guard) = dedup.lock() {
+        guard.last_files_hash = Some(h);
+        guard.last_text = None;
+        guard.last_image_hash = None;
     }
+
+    // 尝试使用原生方式设置文件列表到剪贴板
+    if native_clipboard::set_clipboard_file_list(saved_paths) {
+        info!("已通过原生方式将 {} 个文件写入剪贴板", saved_paths.len());
+        return;
+    }
+
+    // 回退：将文件路径作为文本写入剪贴板
+    warn!("原生文件列表写入失败，回退为文本路径");
+    let path_text = saved_paths
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if let Ok(mut guard) = dedup.lock() {
+        guard.last_text = Some(path_text.clone());
+    }
+
+    let mut ctx = match Clipboard::new() {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Error creating ClipboardContext for fallback: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = ctx.set_text(&path_text) {
+        error!("Error setting file path text to clipboard: {}", e);
+    }
+}
+
+/// 将 RGBA 像素数据编码为 PNG 字节
+fn encode_rgba_to_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let img_buf = image::RgbaImage::from_raw(width, height, rgba.to_vec())
+        .ok_or("无法从 RGBA 数据创建图片缓冲区")?;
+    let mut png_data = Cursor::new(Vec::new());
+    img_buf.write_to(&mut png_data, ImageFormat::Png)?;
+    Ok(png_data.into_inner())
+}
+
+/// 将 PNG 字节解码为 RGBA 像素数据，返回 (width, height, rgba_bytes)
+fn decode_png_to_rgba(png_bytes: &[u8]) -> Result<(usize, usize, Vec<u8>), Box<dyn std::error::Error>> {
+    let img = image::load_from_memory(png_bytes)?;
+    let rgba = img.to_rgba8();
+    let width = rgba.width() as usize;
+    let height = rgba.height() as usize;
+    Ok((width, height, rgba.into_raw()))
 }
 
 /// 获取文件接收目录：Windows 为 ~/temp，Linux 为 /tmp

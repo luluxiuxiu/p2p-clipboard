@@ -9,11 +9,9 @@ pub const CHUNK_DATA_SIZE: usize = 1_500_000;
 pub enum ClipboardContent {
     /// 纯文本内容
     Text(String),
-    /// 图片数据：宽度、高度、RGBA 像素字节
+    /// 图片数据：PNG 编码字节（跨平台统一格式）
     Image {
-        width: usize,
-        height: usize,
-        bytes: Vec<u8>,
+        png_bytes: Vec<u8>,
     },
     /// 文件内容：文件名、文件字节
     File {
@@ -77,8 +75,8 @@ impl ClipboardContent {
                 let preview: String = s.chars().take(50).collect();
                 format!("Text({} bytes, preview: \"{}...\")", s.len(), preview)
             }
-            ClipboardContent::Image { width, height, bytes } => {
-                format!("Image({}x{}, {} bytes)", width, height, bytes.len())
+            ClipboardContent::Image { png_bytes } => {
+                format!("Image(PNG, {} bytes)", png_bytes.len())
             }
             ClipboardContent::File { name, bytes } => {
                 format!("File(\"{}\", {} bytes)", name, bytes.len())
