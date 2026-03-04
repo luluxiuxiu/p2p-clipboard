@@ -7,7 +7,7 @@ license = "MIT"
 authors = ["gnattu"]
 
 [dependencies]
-arboard = { version = "3.6.1",features = ["wayland-data-control"] }
+arboard = { version = "3.6.1", features = ["wayland-data-control", "image-data"] }
 clipboard-master = { git = "https://github.com/gnattu/clipboard-master.git" }
 tokio = { version = "1.38", features = ["full"] }
 async-task = "4.7.0"
@@ -22,3 +22,6 @@ libp2p-mdns = { path = "./lib/mdns", features = ["tokio"] }
 libp2p-tls = { path = "./lib/tls" }
 hex-literal = "0.4.1"
 env_logger = "0.11.1"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+dirs = "5"

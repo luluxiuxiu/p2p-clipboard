@@ -1,3 +1,4 @@
+use crate::clipboard_content::ClipboardContent;
 use ed25519_dalek::{pkcs8::DecodePrivateKey, SigningKey};
 use futures::prelude::*;
 use hex_literal::hex;
@@ -26,6 +27,9 @@ use std::{
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{mpsc, oneshot};
+
+/// 256KB 文本经 zstd 压缩后的最大传输大小，设置为 2MB 以支持图片和文件
+const MAX_TRANSMIT_SIZE: usize = 2 * 1024 * 1024;
 
 #[derive(NetworkBehaviour)]
 struct P2pClipboardBehaviour {
@@ -108,8 +112,8 @@ async fn retry_waiting_thread(
 }
 
 pub async fn start_network(
-    rx: mpsc::Receiver<String>,
-    tx: mpsc::Sender<String>,
+    rx: mpsc::Receiver<ClipboardContent>,
+    tx: mpsc::Sender<ClipboardContent>,
     connect_arg: Option<Vec<String>>,
     key_arg: Option<String>,
     listen_arg: Option<String>,
@@ -263,8 +267,8 @@ pub async fn start_network(
 async fn run(
     mut swarm: Swarm<P2pClipboardBehaviour>,
     gossipsub_topic: IdentTopic,
-    mut rx: mpsc::Receiver<String>,
-    tx: mpsc::Sender<String>,
+    mut rx: mpsc::Receiver<ClipboardContent>,
+    tx: mpsc::Sender<ClipboardContent>,
     boot_node: Option<PeerEndpointCache>,
     retry_queue_tx: UnboundedSender<ConnectionRetryTask>,
     mut retry_callback_queue_rx: UnboundedReceiver<PeerEndpointCache>,
@@ -284,8 +288,14 @@ async fn run(
             sleep = Box::pin(tokio::time::sleep(Duration::from_secs(30)).fuse());
             tokio::select! {
                 Some(message) = rx.recv() => {
-                    debug!("Received local clipboard: {}", message.clone());
-                    Some((gossipsub_topic.clone(), message.clone()))
+                    debug!("Received local clipboard: {}", message.description());
+                    match message.to_bytes() {
+                        Ok(bytes) => Some((gossipsub_topic.clone(), bytes)),
+                        Err(e) => {
+                            error!("Failed to serialize clipboard content: {}", e);
+                            None
+                        }
+                    }
                 },
                 event = swarm.select_next_some() => match event {
                     SwarmEvent::Behaviour(P2pClipboardBehaviourEvent::Gossipsub(ref gossip_event)) => {
@@ -295,11 +305,26 @@ async fn run(
                             message,
                         } = gossip_event
                         {
-                            debug!("Got message: {} with id: {} from peer: {:?}",
-                            String::from_utf8_lossy(&message.data),
-                            id,
-                            peer_id);
-                            tx.send(String::from_utf8_lossy(&message.data).parse().unwrap()).await.expect("Panic when sending to channel");
+                            match ClipboardContent::from_bytes(&message.data) {
+                                Ok(content) => {
+                                    debug!("Got message: {} with id: {} from peer: {:?}",
+                                        content.description(),
+                                        id,
+                                        peer_id);
+                                    if let Err(e) = tx.send(content).await {
+                                        error!("Panic when sending to channel: {}", e);
+                                    }
+                                }
+                                Err(e) => {
+                                    // 向后兼容：尝试作为纯文本解析（旧版本发送的消息）
+                                    let text = String::from_utf8_lossy(&message.data).to_string();
+                                    debug!("Got legacy text message with id: {} from peer: {:?} (bincode err: {})",
+                                        id, peer_id, e);
+                                    if let Err(e) = tx.send(ClipboardContent::Text(text)).await {
+                                        error!("Panic when sending to channel: {}", e);
+                                    }
+                                }
+                            }
                         }
                         None
                     }
@@ -718,11 +743,11 @@ async fn run(
             warn!("Handler completed longer than expected, restarting swarm");
             return;
         }
-        if let Some((topic, line)) = to_publish {
+        if let Some((topic, data)) = to_publish {
             if let Err(err) = swarm
                 .behaviour_mut()
                 .gossipsub
-                .publish(topic.clone(), line.as_bytes())
+                .publish(topic.clone(), data)
             {
                 match err {
                     PublishError::Duplicate => {}
@@ -748,6 +773,7 @@ fn create_gossipsub_behavior(id_keys: Keypair) -> Behaviour<CompressionTransform
         .heartbeat_interval(Duration::from_secs(10))
         .validation_mode(ValidationMode::Strict)
         .message_id_fn(message_id_fn)
+        .max_transmit_size(MAX_TRANSMIT_SIZE)
         .do_px()
         .build()
         .expect("Valid config");
