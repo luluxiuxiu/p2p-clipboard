@@ -372,35 +372,28 @@ fn set_clipboard_file_list_windows(paths: &[PathBuf]) -> bool {
 
 #[cfg(target_os = "linux")]
 fn set_clipboard_file_list_linux(paths: &[PathBuf]) -> bool {
-    // 构建 text/uri-list 格式
-    let uri_list: String = paths
+    // 构建 URI 列表
+    let uris: Vec<String> = paths
         .iter()
         .map(|p| format!("file://{}", p.to_string_lossy()))
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect();
+    let uri_list = uris.join("\n");
 
-    // 构建 x-special/gnome-copied-files 格式（copy\nfile://path1\nfile://path2）
-    let gnome_files = format!(
-        "copy\n{}",
-        paths
-            .iter()
-            .map(|p| format!("file://{}", p.to_string_lossy()))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
+    // 优先尝试 xdg-clipboard-files（通过 xdotool + xclip 的多 target 方案）
+    // xclip 每次 -i 会替换整个剪贴板，无法同时设置多种 MIME 类型
+    // 因此使用 xclip 只写 text/uri-list（Nautilus/Thunar/Dolphin/Nemo 均支持）
 
-    // 尝试使用 xclip 同时设置多种 MIME 类型
-    // xclip 支持通过管道设置指定 MIME 类型
-    if set_clipboard_mime_xclip("text/uri-list", &uri_list)
-        && set_clipboard_mime_xclip("x-special/gnome-copied-files", &gnome_files)
-    {
-        info!("已通过 xclip 将 {} 个文件路径写入剪贴板", paths.len());
+    // 尝试 Wayland 环境（wl-copy 支持同时设置多种 MIME 类型）
+    if set_clipboard_wayland(paths) {
+        info!("已通过 wl-copy 将 {} 个文件路径写入剪贴板", paths.len());
         return true;
     }
 
-    // 尝试 wl-copy（Wayland）
-    if set_clipboard_wayland(paths) {
-        info!("已通过 wl-copy 将 {} 个文件路径写入剪贴板", paths.len());
+    // X11 环境：使用 xclip 写入 text/uri-list
+    // 注意：xclip 每次调用会替换整个剪贴板，所以只写一种格式
+    // text/uri-list 是最通用的文件列表 MIME 类型
+    if set_clipboard_mime_xclip("text/uri-list", &uri_list) {
+        info!("已通过 xclip 将 {} 个文件路径写入剪贴板 (text/uri-list)", paths.len());
         return true;
     }
 
@@ -435,28 +428,62 @@ fn set_clipboard_mime_xclip(mime_type: &str, content: &str) -> bool {
 fn set_clipboard_wayland(paths: &[PathBuf]) -> bool {
     use std::io::Write;
 
-    // wl-copy 支持同时设置多种 MIME 类型
+    // wl-copy 支持通过 --type 设置 MIME 类型
+    // 先写 text/uri-list
     let uri_list: String = paths
         .iter()
         .map(|p| format!("file://{}", p.to_string_lossy()))
         .collect::<Vec<_>>()
         .join("\n");
 
+    // 构建 gnome-copied-files 格式用于 Nautilus 等 GNOME 文件管理器
+    let gnome_files = format!(
+        "copy\n{}",
+        paths
+            .iter()
+            .map(|p| format!("file://{}", p.to_string_lossy()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // wl-copy 支持同时设置多种 MIME 类型，通过 --type 参数
+    // 先尝试写 x-special/gnome-copied-files（包含 copy 前缀，GNOME 文件管理器需要）
+    // 如果失败则回退到 text/uri-list
+    let gnome_result = match std::process::Command::new("wl-copy")
+        .args(["--type", "x-special/gnome-copied-files"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(mut child) => {
+            let write_ok = if let Some(ref mut stdin) = child.stdin {
+                stdin.write_all(gnome_files.as_bytes()).is_ok()
+            } else {
+                false
+            };
+            drop(child.stdin.take());
+            write_ok && child.wait().map(|s| s.success()).unwrap_or(false)
+        }
+        Err(_) => false,
+    };
+
+    if gnome_result {
+        return true;
+    }
+
+    // 回退到 text/uri-list
     match std::process::Command::new("wl-copy")
         .args(["--type", "text/uri-list"])
         .stdin(std::process::Stdio::piped())
         .spawn()
     {
         Ok(mut child) => {
-            if let Some(ref mut stdin) = child.stdin {
-                if stdin.write_all(uri_list.as_bytes()).is_err() {
-                    return false;
-                }
-            }
-            match child.wait() {
-                Ok(status) => status.success(),
-                Err(_) => false,
-            }
+            let write_ok = if let Some(ref mut stdin) = child.stdin {
+                stdin.write_all(uri_list.as_bytes()).is_ok()
+            } else {
+                false
+            };
+            drop(child.stdin.take());
+            write_ok && child.wait().map(|s| s.success()).unwrap_or(false)
         }
         Err(_) => false,
     }

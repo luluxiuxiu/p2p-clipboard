@@ -96,6 +96,46 @@ fn hash_file_paths(paths: &[PathBuf]) -> u64 {
     hasher.finish()
 }
 
+/// 递归收集目录中的所有文件，name 字段保留相对路径（如 "dir/subdir/file.txt"）
+fn collect_dir_files(dir: &std::path::Path, prefix: &str, entries: &mut Vec<FileEntry>) {
+    let read_dir = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            warn!("无法读取目录 {:?}: {}", dir, e);
+            return;
+        }
+    };
+    for entry in read_dir {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("读取目录条目失败: {}", e);
+                continue;
+            }
+        };
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        let relative_name = format!("{}/{}", prefix, name);
+
+        if path.is_file() {
+            match std::fs::read(&path) {
+                Ok(file_bytes) => {
+                    info!("读取目录文件: {} ({} bytes)", relative_name, file_bytes.len());
+                    entries.push(FileEntry {
+                        name: relative_name,
+                        bytes: file_bytes,
+                    });
+                }
+                Err(e) => {
+                    warn!("读取文件失败 {:?}: {}", path, e);
+                }
+            }
+        } else if path.is_dir() {
+            collect_dir_files(&path, &relative_name, entries);
+        }
+    }
+}
+
 fn get_clipboard_content(sender: mpsc::Sender<ClipboardContent>, dedup: SharedDedup) {
     // 优先尝试原生文件列表读取（CF_HDROP / text/uri-list）
     if let Some(file_paths) = native_clipboard::get_clipboard_file_list() {
@@ -116,28 +156,36 @@ fn get_clipboard_content(sender: mpsc::Sender<ClipboardContent>, dedup: SharedDe
         guard.last_image_hash = None;
         drop(guard);
 
-        // 读取所有文件内容
+        // 读取所有文件内容（支持目录递归）
         let mut entries = Vec::new();
         for path in &file_paths {
-            if !path.is_file() {
-                warn!("跳过非文件路径: {:?}", path);
-                continue;
-            }
-            let file_name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            match std::fs::read(path) {
-                Ok(file_bytes) => {
-                    info!("读取文件: {} ({} bytes)", file_name, file_bytes.len());
-                    entries.push(FileEntry {
-                        name: file_name,
-                        bytes: file_bytes,
-                    });
+            if path.is_file() {
+                let file_name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                match std::fs::read(path) {
+                    Ok(file_bytes) => {
+                        info!("读取文件: {} ({} bytes)", file_name, file_bytes.len());
+                        entries.push(FileEntry {
+                            name: file_name,
+                            bytes: file_bytes,
+                        });
+                    }
+                    Err(e) => {
+                        warn!("读取文件失败 {:?}: {}", path, e);
+                    }
                 }
-                Err(e) => {
-                    warn!("读取文件失败 {:?}: {}", path, e);
-                }
+            } else if path.is_dir() {
+                // 递归读取目录中的所有文件，保留相对路径结构
+                let dir_name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "unknown_dir".to_string());
+                info!("递归读取目录: {:?}", path);
+                collect_dir_files(path, &dir_name, &mut entries);
+            } else {
+                warn!("跳过不支持的路径类型: {:?}", path);
             }
         }
 
@@ -294,12 +342,16 @@ fn set_clipboard_content(content: &ClipboardContent, dedup: &SharedDedup) {
                 .map(|f| (f.name.as_str(), f.bytes.as_slice()))
                 .collect();
             let saved_paths = save_received_files(&file_refs);
-            set_file_clipboard(&saved_paths, dedup);
+            // 对于包含子目录的文件，剪贴板应写入顶层目录/文件路径
+            // 例如 "dir/a.txt" 和 "dir/b.txt" 应该只写入 "dir" 目录
+            let clipboard_paths = deduplicate_to_top_level_paths(&saved_paths);
+            set_file_clipboard(&clipboard_paths, dedup);
         }
     }
 }
 
 /// 批量保存接收到的文件到本地，返回成功保存的路径列表
+/// 支持带相对路径的文件名（如 "dir/subdir/file.txt"），会自动创建子目录
 fn save_received_files(files: &[(&str, &[u8])]) -> Vec<PathBuf> {
     let dest_dir = get_file_receive_dir();
     if let Err(e) = std::fs::create_dir_all(&dest_dir) {
@@ -310,8 +362,26 @@ fn save_received_files(files: &[(&str, &[u8])]) -> Vec<PathBuf> {
     let mut saved_paths = Vec::new();
     for (name, bytes) in files {
         let dest_path = dest_dir.join(name);
+        // 如果文件名包含子目录路径，先创建父目录
+        if let Some(parent) = dest_path.parent() {
+            if !parent.exists() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    error!("创建子目录失败 {:?}: {}", parent, e);
+                    continue;
+                }
+            }
+        }
         match std::fs::write(&dest_path, bytes) {
             Ok(_) => {
+                // Linux 上设置合理的文件权限（owner 读写，group/other 只读）
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let perms = std::fs::Permissions::from_mode(0o644);
+                    if let Err(e) = std::fs::set_permissions(&dest_path, perms) {
+                        warn!("设置文件权限失败 {:?}: {}", dest_path, e);
+                    }
+                }
                 info!("文件已保存: {:?} ({} bytes)", dest_path, bytes.len());
                 saved_paths.push(dest_path);
             }
@@ -321,6 +391,32 @@ fn save_received_files(files: &[(&str, &[u8])]) -> Vec<PathBuf> {
         }
     }
     saved_paths
+}
+
+/// 将保存的文件路径列表去重为顶层路径
+/// 例如：["/tmp/dir/a.txt", "/tmp/dir/b.txt", "/tmp/file.txt"]
+/// 去重后：["/tmp/dir", "/tmp/file.txt"]
+/// 这样写入剪贴板时，用户粘贴的是完整目录而不是散落的子文件
+fn deduplicate_to_top_level_paths(saved_paths: &[PathBuf]) -> Vec<PathBuf> {
+    let dest_dir = get_file_receive_dir();
+    let mut top_level: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
+    for path in saved_paths {
+        // 计算相对于接收目录的路径
+        if let Ok(relative) = path.strip_prefix(&dest_dir) {
+            // 取第一级组件（文件名或顶层目录名）
+            let mut components = relative.components();
+            if let Some(first) = components.next() {
+                let top_path = dest_dir.join(first.as_os_str());
+                top_level.insert(top_path);
+            }
+        } else {
+            // 无法计算相对路径，直接使用原路径
+            top_level.insert(path.clone());
+        }
+    }
+
+    top_level.into_iter().collect()
 }
 
 /// 将已保存的文件路径列表写入剪贴板（使用原生格式）
