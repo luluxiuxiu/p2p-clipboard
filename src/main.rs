@@ -3,11 +3,12 @@ mod native_clipboard;
 mod network;
 
 use arboard::Clipboard;
+use chrono::Local;
 use clap::Parser;
 use clipboard_content::{ClipboardContent, FileEntry};
 use clipboard_master::{CallbackResult, ClipboardHandler, Master};
-use env_logger::Env;
-use log::{debug, error, info, warn};
+use fern::Dispatch;
+use log::{debug, error, info, warn, LevelFilter};
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -342,11 +343,129 @@ async fn channel_proxy(
     }
 }
 
+/// 获取日志文件路径
+/// Windows: <exe所在目录>/log/p2p-clipboard.log
+/// Linux: /var/log/p2p-clipboard.log，无权限时回退到 ~/.local/share/p2p-clipboard/p2p-clipboard.log
+fn get_log_file_path() -> PathBuf {
+    if cfg!(target_os = "windows") {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."));
+        exe_dir.join("log")
+    } else {
+        let var_log = PathBuf::from("/var/log");
+        // 检查 /var/log 是否可写
+        let test_file = var_log.join(".p2p-clipboard-write-test");
+        if std::fs::write(&test_file, b"").is_ok() {
+            let _ = std::fs::remove_file(&test_file);
+            var_log
+        } else {
+            // 回退到用户目录
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".local")
+                .join("share")
+                .join("p2p-clipboard")
+        }
+    }
+}
+
+/// 初始化日志系统：同时输出到控制台和文件
+/// 文件日志包含详细的时间戳、级别、模块路径
+/// 按日期命名日志文件，格式: p2p-clipboard-YYYY-MM-DD.log
+fn init_logging() -> Result<(), fern::InitError> {
+    let log_dir = get_log_file_path();
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        eprintln!("无法创建日志目录 {:?}: {}", log_dir, e);
+        // 仅控制台输出
+        Dispatch::new()
+            .format(|out, message, record| {
+                out.finish(format_args!(
+                    "{} [{}] [{}] {}",
+                    Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+                    record.level(),
+                    record.target(),
+                    message
+                ))
+            })
+            .level(LevelFilter::Info)
+            .level_for("libp2p_gossipsub", LevelFilter::Warn)
+            .level_for("libp2p_identify", LevelFilter::Warn)
+            .level_for("libp2p_kad", LevelFilter::Warn)
+            .level_for("libp2p_tcp", LevelFilter::Warn)
+            .level_for("yamux", LevelFilter::Warn)
+            .level_for("multistream_select", LevelFilter::Warn)
+            .chain(io::stdout())
+            .apply()?;
+        return Ok(());
+    }
+
+    let date_str = Local::now().format("%Y-%m-%d").to_string();
+    let log_file_path = log_dir.join(format!("p2p-clipboard-{}.log", date_str));
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file_path)
+        .map_err(|e| fern::InitError::Io(e))?;
+
+    // 控制台输出：简洁格式
+    let stdout_dispatch = Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "{} [{}] {}",
+                Local::now().format("%H:%M:%S"),
+                record.level(),
+                message
+            ))
+        })
+        .level(LevelFilter::Info)
+        .level_for("libp2p_gossipsub", LevelFilter::Warn)
+        .level_for("libp2p_identify", LevelFilter::Warn)
+        .level_for("libp2p_kad", LevelFilter::Warn)
+        .level_for("libp2p_tcp", LevelFilter::Warn)
+        .level_for("yamux", LevelFilter::Warn)
+        .level_for("multistream_select", LevelFilter::Warn)
+        .chain(io::stdout());
+
+    // 文件输出：详细格式，包含时间戳、级别、模块路径
+    let file_dispatch = Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "{} [{}] [{}:{}] [{}] {}",
+                Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+                record.level(),
+                record.target(),
+                record.line().unwrap_or(0),
+                std::thread::current().name().unwrap_or("unnamed"),
+                message
+            ))
+        })
+        .level(LevelFilter::Debug)
+        .level_for("libp2p_gossipsub", LevelFilter::Info)
+        .level_for("libp2p_identify", LevelFilter::Info)
+        .level_for("libp2p_kad", LevelFilter::Info)
+        .level_for("libp2p_tcp", LevelFilter::Warn)
+        .level_for("yamux", LevelFilter::Warn)
+        .level_for("multistream_select", LevelFilter::Warn)
+        .chain(file);
+
+    Dispatch::new()
+        .chain(stdout_dispatch)
+        .chain(file_dispatch)
+        .apply()?;
+
+    info!("日志文件: {:?}", log_file_path);
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
-    env_logger::Builder::from_env(Env::default().default_filter_or("info"))
-        .target(env_logger::Target::Stdout)
-        .init();
+    if let Err(e) = init_logging() {
+        eprintln!("日志初始化失败: {}", e);
+        std::process::exit(1);
+    }
     let Args {
         connect,
         key,

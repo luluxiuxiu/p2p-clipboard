@@ -21,7 +21,8 @@ zstd = "0.13.0"
 libp2p-mdns = { path = "./lib/mdns", features = ["tokio"] }
 libp2p-tls = { path = "./lib/tls" }
 hex-literal = "0.4.1"
-env_logger = "0.11.1"
+fern = "0.7"
+chrono = "0.4"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 dirs = "5"
